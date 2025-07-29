@@ -36,14 +36,16 @@ input double InpLimitDistance = 0.00050;                  // How far to place pe
 input group "=== RISK MANAGEMENT ==="
 enum ENUM_SL_TYPE
 {
-   SL_FIXED = 0,             // Fixed stop loss
-   SL_TRAILING = 1           // Ghost trailing stop loss
+   SL_FIXED = 0,             // Fixed stop loss only
+   SL_TRAILING = 1,          // Ghost trailing stop loss (immediate)
+   SL_HYBRID = 2             // Fixed SL + Trailing after profit threshold
 };
 input ENUM_SL_TYPE InpStopLossType = SL_FIXED;            // Stop loss management type
 
 input double InpStopLossDistance = 0.00200;               // Stop loss distance from entry (pure price)
 input double InpTakeProfitDistance = 0.00300;             // Profit target distance from entry (pure price)
 input double InpTrailingDistance = 0.00100;               // Trailing stop distance (for trailing SL)
+input double InpTrailingActivationDistance = 0.00050;     // Profit threshold to activate trailing (0 = immediate)
 
 input group "=== POSITION SIZING ==="
 enum ENUM_LOT_MODE
@@ -81,6 +83,7 @@ struct PositionInfo
    double currentTP;
    ENUM_POSITION_TYPE type;
    datetime openTime;
+   bool trailingActivated;
 };
 
 PositionInfo activePositions[];
@@ -143,7 +146,7 @@ void OnTick()
    UpdatePositions();
    
    // Handle trailing stops
-   if(InpStopLossType == SL_TRAILING)
+   if(InpStopLossType == SL_TRAILING || InpStopLossType == SL_HYBRID)
    {
       HandleTrailingStops();
    }
@@ -350,6 +353,7 @@ void AddPositionToTracking(ulong ticket, double openPrice, double sl, double tp,
    activePositions[positionCount].currentTP = tp;
    activePositions[positionCount].type = type;
    activePositions[positionCount].openTime = TimeCurrent();
+   activePositions[positionCount].trailingActivated = (InpStopLossType == SL_TRAILING);
    positionCount++;
 }
 
@@ -570,8 +574,31 @@ void UpdateChartInfo()
    info += "Timeframe: " + EnumToString(InpTimeframe) + "\n";
    info += "Trigger Distance: " + DoubleToString(InpTriggerDistance, 5) + "\n";
    info += "Trading Mode: " + (InpTradingMode == MODE_COUNTER_TREND ? "Counter-Trend" : "Trend-Following") + "\n";
-   info += "SL Type: " + (InpStopLossType == SL_FIXED ? "Fixed" : "Trailing") + "\n";
+   
+   string slTypeStr = "Fixed";
+   if(InpStopLossType == SL_TRAILING) slTypeStr = "Trailing";
+   else if(InpStopLossType == SL_HYBRID) slTypeStr = "Hybrid";
+   info += "SL Type: " + slTypeStr + "\n";
+   
+   if(InpStopLossType == SL_HYBRID)
+   {
+      info += "Activation Threshold: " + DoubleToString(InpTrailingActivationDistance, 5) + "\n";
+   }
+   
    info += "Active Positions: " + IntegerToString(positionCount) + "\n";
+   
+   // Count trailing activated positions
+   int trailingActive = 0;
+   for(int i = 0; i < positionCount; i++)
+   {
+      if(activePositions[i].trailingActivated) trailingActive++;
+   }
+   
+   if(InpStopLossType == SL_HYBRID && positionCount > 0)
+   {
+      info += "Trailing Active: " + IntegerToString(trailingActive) + "/" + IntegerToString(positionCount) + "\n";
+   }
+   
    info += "Current Equity: " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\n";
    
    ObjectSetString(0, infoLabelName, OBJPROP_TEXT, info);
@@ -642,36 +669,63 @@ void HandleTrailingStops()
          double currentSL = PositionGetDouble(POSITION_SL);
          double openPrice = activePositions[i].openPrice;
          
-         double newSL = currentSL;
-         bool shouldUpdate = false;
-         
-         if(activePositions[i].type == POSITION_TYPE_BUY)
+         // Check if trailing should be activated for hybrid mode
+         if(InpStopLossType == SL_HYBRID && !activePositions[i].trailingActivated)
          {
-            // For BUY positions, trail SL upward
-            double trailSL = currentPrice - InpTrailingDistance;
-            if(trailSL > currentSL)
+            bool profitThresholdReached = false;
+            
+            if(activePositions[i].type == POSITION_TYPE_BUY)
             {
-               newSL = trailSL;
-               shouldUpdate = true;
+               // BUY: Check if price moved up by activation distance
+               profitThresholdReached = (currentPrice >= openPrice + InpTrailingActivationDistance);
+            }
+            else
+            {
+               // SELL: Check if price moved down by activation distance
+               profitThresholdReached = (currentPrice <= openPrice - InpTrailingActivationDistance);
+            }
+            
+            if(profitThresholdReached)
+            {
+               activePositions[i].trailingActivated = true;
+               Print("Trailing activated for position ", activePositions[i].ticket, " - profit threshold reached");
             }
          }
-         else
-         {
-            // For SELL positions, trail SL downward
-            double trailSL = currentPrice + InpTrailingDistance;
-            if(trailSL < currentSL)
-            {
-               newSL = trailSL;
-               shouldUpdate = true;
-            }
-         }
          
-         if(shouldUpdate)
+         // Apply trailing logic if activated
+         if(activePositions[i].trailingActivated)
          {
-            newSL = NormalizeDouble(newSL, _Digits);
-            if(trade.PositionModify(activePositions[i].ticket, newSL, activePositions[i].currentTP))
+            double newSL = currentSL;
+            bool shouldUpdate = false;
+            
+            if(activePositions[i].type == POSITION_TYPE_BUY)
             {
-               activePositions[i].currentSL = newSL;
+               // For BUY positions, trail SL upward
+               double trailSL = currentPrice - InpTrailingDistance;
+               if(trailSL > currentSL)
+               {
+                  newSL = trailSL;
+                  shouldUpdate = true;
+               }
+            }
+            else
+            {
+               // For SELL positions, trail SL downward
+               double trailSL = currentPrice + InpTrailingDistance;
+               if(trailSL < currentSL)
+               {
+                  newSL = trailSL;
+                  shouldUpdate = true;
+               }
+            }
+            
+            if(shouldUpdate)
+            {
+               newSL = NormalizeDouble(newSL, _Digits);
+               if(trade.PositionModify(activePositions[i].ticket, newSL, activePositions[i].currentTP))
+               {
+                  activePositions[i].currentSL = newSL;
+               }
             }
          }
       }

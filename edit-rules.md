@@ -1,0 +1,1 @@
+Try not to make bulk edits at once, rather write into the file in batches and wait 2 seconds in between batches , this is so that the IDE's edit tool is not overwhelmed.
